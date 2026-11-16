@@ -1,0 +1,13 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+
+File.open(ENV.fetch("FAKE_HERDR_LOG"), "a") { |f| f.puts ARGV.join(" ") }
+if ARGV == ["ls"]
+  puts JSON.generate({"spaces" => JSON.parse(File.read(ENV.fetch("FAKE_HERDR_SPACES")))})
+elsif ARGV[0, 2] == ["do", "space.select"] || ARGV[0, 2] == ["do", "tab.new"]
+  puts JSON.generate({"ok" => true})
+else
+  abort "unexpected herdr-app command: #{ARGV.inspect}"
+end

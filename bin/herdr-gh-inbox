@@ -1,0 +1,695 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "open3"
+require "io/console"
+require "uri"
+require "time"
+
+module HerdrGhInbox
+  HUMAN_REASONS = %w[approval_requested assign member_feature_requested mention review_requested security_alert team_mention].freeze
+  DEFAULT_INTERVAL = 60
+
+  class ApiError < StandardError; end
+  class AuthError < ApiError; end
+
+  class Gh
+    def initialize(command = ENV.fetch("HERDR_GH_INBOX_GH", "gh"))
+      @command = command
+    end
+
+    def request(path, method: "GET", headers: [])
+      args = [@command, "api", "--include", "--method", method, path]
+      headers.each { |header| args.concat(["--header", header]) }
+      output, error, status = Open3.capture3(*args)
+      match = output.match(/\AHTTP\/\S+\s+(\d+)[^\r\n]*\r?\n/)
+      unless match
+        message = error.strip.empty? ? output.strip : error.strip
+        raise AuthError, message if message.match?(/auth|login|token|401|403/i)
+        raise ApiError, message.empty? ? "gh api failed" : message
+      end
+      code = match[1].to_i
+      separator = output.index("\r\n\r\n") || output.index("\n\n")
+      raise ApiError, "Invalid gh api headers" unless separator
+
+      gap = output[separator, 4] == "\r\n\r\n" ? 4 : 2
+      header_text = output[match[0].length...separator]
+      response_headers = {}
+      header_text.each_line do |line|
+        name, value = line.split(":", 2)
+        response_headers[name.downcase] = value.strip if value
+      end
+      body = output[(separator + gap)..]
+      raise AuthError, error.strip.empty? ? "GitHub authentication failed (#{code})" : error.strip if code == 401
+      raise ApiError, "GitHub API #{code}: #{error.strip.empty? ? body.strip : error.strip}" if code >= 400 || !status.success? && code != 304
+      [code, response_headers, body]
+    rescue Errno::ENOENT
+      raise ApiError, "gh command not found: #{@command}"
+    end
+
+    def json(path)
+      _code, _headers, body = request(path)
+      JSON.parse(body)
+    end
+
+    def browse(item)
+      repo = item.dig("repository", "full_name")
+      raise ApiError, "Notification has no repository" unless repo
+
+      subject = item.fetch("subject", {})
+      path = URI(subject["url"]).path if subject["url"]
+      number = path&.match(%r{/(?:issues|pulls)/(\d+)\z})&.[](1)
+      args = [@command, "browse"]
+      args << number if number
+      args << "--releases" if subject["type"] == "Release"
+      args.concat(["--repo", repo])
+      _out, err, status = Open3.capture3(*args)
+      raise ApiError, err.strip.empty? ? "gh browse failed" : err.strip unless status.success?
+    rescue Errno::ENOENT
+      raise ApiError, "gh command not found: #{@command}"
+    end
+  end
+
+  class HerdrApp
+    DEFAULT_TASK = "Please review this %{type}: %{url}"
+
+    def initialize(command = ENV.fetch("HERDR_GH_INBOX_HERDR_APP", "herdr-app"), repo_dirs: ENV.fetch("HERDR_GH_INBOX_REPO_DIRS", "{}"))
+      @command = command
+      @repo_dirs = JSON.parse(repo_dirs)
+      raise ApiError, "HERDR_GH_INBOX_REPO_DIRS must be a JSON object" unless @repo_dirs.is_a?(Hash)
+    rescue JSON::ParserError => e
+      raise ApiError, "Invalid HERDR_GH_INBOX_REPO_DIRS: #{e.message}"
+    end
+
+    def spaces
+      response = call("ls")
+      JSON.parse(response).fetch("spaces")
+    rescue JSON::ParserError, KeyError => e
+      raise ApiError, "Invalid herdr-app ls response: #{e.message}"
+    end
+
+    def destination(item)
+      repo = item.dig("repository", "full_name")
+      raise ApiError, "Notification has no repository" unless repo
+
+      space = spaces.find do |candidate|
+        candidate["machine"].nil? && repo_root(candidate["folder"], repo)
+      end
+      root = space && repo_root(space["folder"], repo)
+      root ||= repo_root(@repo_dirs[repo], repo)
+      root ||= repo_root(Dir.pwd, repo)
+      [space, root]
+    end
+
+    def select_space(item)
+      space, root = destination(item)
+      raise ApiError, "Local clone not found for #{item.dig('repository', 'full_name')}" unless root
+      raise ApiError, "No Herdr space for #{item.dig('repository', 'full_name')}" unless space
+
+      call("do", "space.select", JSON.generate({"id" => space.fetch("id")}))
+      space
+    end
+
+    def launch_agent(item)
+      space, root = destination(item)
+      raise ApiError, "Local clone not found for #{item.dig('repository', 'full_name')}" unless root
+
+      argv = JSON.parse(ENV.fetch("HERDR_GH_INBOX_AGENT_ARGV", '["claude"]'))
+      raise ApiError, "HERDR_GH_INBOX_AGENT_ARGV must be a nonempty JSON string array" unless argv.is_a?(Array) && !argv.empty? && argv.all? { |arg| arg.is_a?(String) && !arg.empty? }
+
+      repo = item.dig("repository", "full_name")
+      type = case item.dig("subject", "type")
+             when "PullRequest" then "PR"
+             when "Issue" then "issue"
+             else "notification"
+             end
+      template = ENV.fetch("HERDR_GH_INBOX_TASK_TEMPLATE", DEFAULT_TASK)
+      task = template.gsub("%{type}", type).gsub("%{url}", subject_url(item)).gsub("%{repo}", repo)
+      raise ApiError, "Unknown task placeholder in HERDR_GH_INBOX_TASK_TEMPLATE" if task.include?("%{")
+      params = {"name" => "Review #{repo.split('/').last}", "folder" => root, "argv" => argv, "task" => task}
+      params["space"] = space["id"] if space
+      call("do", "tab.new", JSON.generate(params))
+      params
+    rescue JSON::ParserError, KeyError, ArgumentError => e
+      raise ApiError, "Invalid agent configuration: #{e.message}"
+    end
+
+    def self.subject_url(item)
+      api = item.dig("subject", "url")
+      repo = item.dig("repository", "full_name")
+      return "https://github.com/#{repo}" unless api
+
+      uri = URI(api)
+      raise ApiError, "Unexpected subject API host" unless uri.scheme == "https" && uri.host == "api.github.com"
+
+      path = uri.path.sub(%r{\A/repos/}, "/")
+      path = path.sub(%r{/pulls/(\d+)\z}, '/pull/\1')
+      path = "/#{repo}/releases" if item.dig("subject", "type") == "Release"
+      "https://github.com#{path}"
+    end
+
+    private
+
+    def subject_url(item)
+      self.class.subject_url(item)
+    end
+
+    def call(*args)
+      output, error, status = Open3.capture3(@command, *args)
+      raise ApiError, error.strip.empty? ? "herdr-app #{args.first} failed" : error.strip unless status.success?
+
+      output
+    rescue Errno::ENOENT
+      raise ApiError, "herdr-app command not found: #{@command}"
+    end
+
+    def repo_root(folder, expected_repo)
+      return nil unless folder && File.directory?(folder)
+
+      current = File.expand_path(folder)
+      loop do
+        git = File.join(current, ".git")
+        if File.directory?(git) || File.file?(git)
+          config = git_config(git)
+          return current if config && github_remote(config).casecmp?(expected_repo)
+          return nil
+        end
+        parent = File.dirname(current)
+        return nil if parent == current
+
+        current = parent
+      end
+    end
+
+    def git_config(git)
+      if File.directory?(git)
+        path = File.join(git, "config")
+      else
+        pointer = File.read(git)[/\Agitdir:\s*(.+)\s*\z/, 1]
+        return nil unless pointer
+
+        gitdir = File.expand_path(pointer.strip, File.dirname(git))
+        common = File.join(gitdir, "commondir")
+        gitdir = File.expand_path(File.read(common).strip, gitdir) if File.file?(common)
+        path = File.join(gitdir, "config")
+      end
+      File.file?(path) ? File.read(path) : nil
+    rescue SystemCallError
+      nil
+    end
+
+    def github_remote(config)
+      urls = config.scan(/^\s*url\s*=\s*(\S+)/).flatten
+      urls.each do |url|
+        match = url.match(%r{\A(?:git@|https://|ssh://git@)github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?/?\z}i)
+        return match[1] if match
+      end
+      ""
+    end
+  end
+
+  class Inbox
+    attr_reader :items, :interval, :last_checked_at
+
+    def initialize(gh:, output: $stdout, osc: true)
+      @gh = gh
+      @output = output
+      @osc = osc
+      @items = []
+      @cache = {}
+      @last_modified = nil
+      @interval = DEFAULT_INTERVAL
+      @state = nil
+      @last_checked_at = nil
+    end
+
+    def fetch(force: false)
+      headers = []
+      headers << "If-Modified-Since: #{@last_modified}" if @last_modified && !force
+      code, response_headers, body = @gh.request("/notifications?participating=true&per_page=50&page=1", headers: headers)
+      poll = response_headers["x-poll-interval"].to_i
+      @interval = [DEFAULT_INTERVAL, poll].max
+      @last_checked_at = Time.now
+      return false if code == 304
+
+      pages = JSON.parse(body)
+      raise ApiError, "Expected a notifications array" unless pages.is_a?(Array)
+      all = pages.dup
+      page = 1
+      while pages.length == 50
+        page += 1
+        _code, _headers, page_body = @gh.request("/notifications?participating=true&per_page=50&page=#{page}")
+        pages = JSON.parse(page_body)
+        raise ApiError, "Expected a notifications array" unless pages.is_a?(Array)
+        all.concat(pages)
+      end
+      human, other = all.select { |item| item["unread"] }.partition { |item| HUMAN_REASONS.include?(item["reason"]) }
+      @items = human + other
+      @last_modified = response_headers["last-modified"]
+      @cache.select! { |id, _| @items.any? { |item| item["id"] == id } }
+      report_state(state_for_items)
+      true
+    rescue AuthError
+      report_state("blocked:kind=auth")
+      raise
+    rescue StandardError
+      report_state("error")
+      raise
+    end
+
+    def detail(item)
+      @cache[item.fetch("id")] ||= begin
+        subject = item.fetch("subject")
+        main = subject["url"] ? @gh.json(api_path(subject["url"])) : {}
+        comment = subject["latest_comment_url"] ? @gh.json(api_path(subject["latest_comment_url"])) : nil
+        [main, comment]
+      end
+    end
+
+    def cached_detail(item)
+      @cache[item.fetch("id")]
+    end
+
+    def mark(item, method)
+      mark_request(item, method)
+      complete_mark(item)
+    end
+
+    def mark_request(item, method)
+      @gh.request("/notifications/threads/#{item.fetch('id')}", method: method)
+    end
+
+    def complete_mark(item)
+      @items.delete(item)
+      @last_modified = nil
+      report_state(state_for_items)
+    end
+
+    def browse(item)
+      @gh.browse(item)
+    end
+
+    def report_state(state)
+      return if @state == state
+
+      @state = state
+      @output.write("\e]7501;state=#{state}\e\\") if @osc
+      @output.flush
+    end
+
+    def state_for_items
+      return "idle" if @items.empty?
+      return "blocked:kind=question" if @items.any? { |item| HUMAN_REASONS.include?(item["reason"]) }
+
+      "done"
+    end
+
+    private
+
+    def api_path(url)
+      uri = URI(url)
+      raise ApiError, "Unexpected subject API host" unless uri.scheme == "https" && uri.host == "api.github.com"
+
+      uri.request_uri
+    end
+  end
+
+  module Display
+    module_function
+
+    REPO_WIDTH = 24
+    TYPE_WIDTH = 11
+    REASON_WIDTH = 22
+    AGE_WIDTH = 5
+
+    def clean(text)
+      text.to_s.gsub(/\e\[[0-9;]*[[:alpha:]]/, "").gsub(/[\x00-\x08\x0b-\x1f\x7f]/, " ").gsub(/\s+/, " ").strip
+    end
+
+    def wide?(cp)
+      (0x1100..0x115f).cover?(cp) || (0x2329..0x232a).cover?(cp) ||
+        (0x2e80..0xa4cf).cover?(cp) || (0xac00..0xd7a3).cover?(cp) ||
+        (0xf900..0xfaff).cover?(cp) || (0xfe10..0xfe6f).cover?(cp) ||
+        (0xff01..0xff60).cover?(cp) || (0xffe0..0xffe6).cover?(cp) ||
+        (0x1f300..0x1faff).cover?(cp) || (0x20000..0x3fffd).cover?(cp)
+    end
+
+    def cell_width(char)
+      cp = char.ord
+      return 0 if (0x300..0x36f).cover?(cp) || (0xfe00..0xfe0f).cover?(cp) || cp == 0x200d
+      wide?(cp) ? 2 : 1
+    end
+
+    def width(text)
+      text.each_char.sum { |char| cell_width(char) }
+    end
+
+    def clip(text, width)
+      return "" if width <= 0
+      result = +""
+      used = 0
+      clean(text).each_char do |char|
+        size = cell_width(char)
+        break if used + size > width
+        result << char
+        used += size
+      end
+      result + (" " * (width - used))
+    end
+
+    def wrap(text, width)
+      return [] if width <= 0
+
+      text.to_s.split("\n", -1).flat_map do |paragraph|
+        current = +""
+        used = 0
+        result = []
+        clean(paragraph).each_char do |char|
+          size = cell_width(char)
+          if used + size > width
+            result << current
+            current = +""
+            used = 0
+          end
+          current << char
+          used += size
+        end
+        result << current
+        result
+      end
+    end
+
+    def age(updated_at, now: Time.now)
+      seconds = [now.to_i - Time.iso8601(updated_at).to_i, 0].max
+      return "#{seconds / 60}m" if seconds < 3600
+      return "#{seconds / 3600}h" if seconds < 86_400
+      return "#{seconds / 86_400}d" if seconds < 604_800
+
+      "#{seconds / 604_800}w"
+    rescue ArgumentError, TypeError
+      "?"
+    end
+
+    def item_line(item, now: Time.now)
+      repo = (item.dig("repository", "full_name") || "?").split("/").last
+      subject = item.fetch("subject", {})
+      type = subject["type"] == "PullRequest" ? "PR" : subject["type"] || "?"
+      fields = [clip(repo, REPO_WIDTH), clip(type, TYPE_WIDTH), clip(item["reason"] || "?", REASON_WIDTH), clip(age(item["updated_at"], now: now), AGE_WIDTH)]
+      "#{fields.join(' ')} #{clean(subject['title'] || '?')}"
+    end
+
+    def heading
+      [clip("REPO", REPO_WIDTH), clip("TYPE", TYPE_WIDTH), clip("REASON", REASON_WIDTH), clip("AGE", AGE_WIDTH), "TITLE"].join(" ")
+    end
+  end
+
+  class Tui
+    def initialize(inbox, input: $stdin, output: $stdout)
+      @inbox = inbox
+      @input = input
+      @output = output
+      @selected = 0
+      @resume_index = 0
+      @message = ""
+      @mark_thread = nil
+      @marking_item = nil
+      @mark_verb = nil
+      @quit_after_mark = false
+      @detail_thread = nil
+      @detail_item = nil
+      @detail_error = nil
+    end
+
+    def run
+      @inbox.fetch
+      start_detail
+      next_fetch = Process.clock_gettime(Process::CLOCK_MONOTONIC) + @inbox.interval
+      @input.raw do
+        @output.write("\e[?1049h\e[?25l")
+        begin
+          redraw = true
+          last_size = nil
+          loop do
+            redraw = true if finish_mark
+            redraw = true if finish_detail
+            break if @quit_after_mark && !@mark_thread
+            @next_fetch = next_fetch
+            size = @output.winsize
+            if redraw || size != last_size
+              draw
+              last_size = size
+              redraw = false
+            end
+            now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            timeout = @mark_thread || @detail_thread ? 0.05 : 1
+            ready = IO.select([@input], nil, nil, [[next_fetch - now, 0].max, timeout].min)
+            if ready
+              key = @input.getc
+              break if key.nil? && !@mark_thread
+              if key == "q"
+                if @mark_thread
+                  @quit_after_mark = true
+                  @message = "Finishing #{@mark_verb} before exit…"
+                else
+                  break
+                end
+              elsif key
+                next_fetch = handle(key, next_fetch)
+              end
+              redraw = true
+            elsif !@mark_thread && Process.clock_gettime(Process::CLOCK_MONOTONIC) >= next_fetch
+              refresh
+              next_fetch = Process.clock_gettime(Process::CLOCK_MONOTONIC) + @inbox.interval
+              redraw = true
+            end
+          end
+        ensure
+          @output.write("\e[?25h\e[?1049l")
+          @output.flush
+        end
+      end
+    end
+
+    private
+
+    def refresh(force: false)
+      id = @selected && @inbox.items[@selected]&.fetch("id")
+      changed = @inbox.fetch(force: force)
+      if changed && @selected
+        @selected = [[@inbox.items.index { |item| item["id"] == id } || @selected, 0].max, [@inbox.items.size - 1, 0].max].min
+      end
+      start_detail if changed
+      @message = "" if changed
+    rescue ApiError => e
+      @message = "Error: #{e.message}"
+    end
+
+    def handle(key, next_fetch)
+      return next_fetch if @mark_thread
+
+      case key
+      when "j"
+        @selected = [@selected ? @selected + 1 : @resume_index, @inbox.items.size - 1].min
+        @detail_error = nil
+        start_detail
+      when "k"
+        @selected = [@selected ? @selected - 1 : @resume_index - 1, 0].max
+        @detail_error = nil
+        start_detail
+      when "\r", "\n"
+        if (item = selected_item)
+          start_detail
+        end
+      when "r", "d"
+        if (item = selected_item)
+          @resume_index = @selected
+          @selected = nil
+          @marking_item = item
+          @mark_verb = key == "r" ? "read" : "done"
+          @message = "Marking #{@mark_verb}…"
+          method = key == "r" ? "PATCH" : "DELETE"
+          @mark_thread = Thread.new do
+            begin
+              @inbox.mark_request(item, method)
+              nil
+            rescue StandardError => e
+              e
+            end
+          end
+        end
+      when "o"
+        if (item = selected_item)
+          begin
+            @inbox.browse(item)
+            @message = "Opened in browser"
+          rescue ApiError => e
+            @message = e.message
+          end
+        end
+      when "g"
+        if (item = selected_item)
+          begin
+            space = herdr.select_space(item)
+            @message = "Switched to #{space['name']}"
+          rescue ApiError => e
+            @message = e.message
+          end
+        end
+      when "a"
+        if (item = selected_item)
+          begin
+            params = herdr.launch_agent(item)
+            @message = "Started #{params['argv'].first} in #{params['folder']}"
+          rescue ApiError => e
+            @message = e.message
+          end
+        end
+      when "R"
+        refresh(force: true)
+        next_fetch = Process.clock_gettime(Process::CLOCK_MONOTONIC) + @inbox.interval
+      end
+      next_fetch
+    end
+
+    def selected_item
+      @selected && @inbox.items[@selected]
+    end
+
+    def herdr
+      @herdr ||= HerdrApp.new
+    end
+
+    def start_detail
+      item = selected_item
+      return unless item
+      return if @inbox.cached_detail(item) || @detail_thread
+
+      @detail_error = nil
+      @detail_item = item
+      @detail_thread = Thread.new do
+        begin
+          @inbox.detail(item)
+          nil
+        rescue StandardError => e
+          e
+        end
+      end
+    end
+
+    def finish_detail
+      return false unless @detail_thread
+      return false if @detail_thread.alive?
+
+      error = @detail_thread.value
+      @detail_error = error if selected_item && selected_item["id"] == @detail_item["id"]
+      @detail_thread = nil
+      @detail_item = nil
+      start_detail unless error
+      true
+    end
+
+    def finish_mark
+      return false unless @mark_thread
+      return false if @mark_thread.alive?
+
+      error = @mark_thread.value
+      if error
+        @message = "#{@mark_verb} failed: #{error.message} · j/k to select"
+      else
+        @inbox.complete_mark(@marking_item)
+        @message = "Marked #{@mark_verb} · j/k to select"
+      end
+      @mark_thread = nil
+      @marking_item = nil
+      @mark_verb = nil
+      start_detail
+      true
+    end
+
+    def draw
+      rows, cols = @output.winsize
+      rows = [rows, 5].max
+      cols = [cols, 20].max
+      left_width = cols >= 100 ? cols * 2 / 3 : cols
+      visible = rows - 3
+      first = [(@selected || @resume_index) - visible + 1, 0].max
+      title = "GitHub inbox: #{@inbox.items.length} unread | j/k move Enter read r read d done o open g space a agent R refresh q quit"
+      heading = "  #{Display.heading}"
+      now = Time.now
+      items = @inbox.items[first, visible] || []
+      detail_lines = []
+      if (item = selected_item || @marking_item)
+        detail_width = cols >= 100 ? cols - left_width : cols
+        detail_lines.concat(Display.wrap(Display.item_line(item, now: now), detail_width))
+        if (pair = @inbox.cached_detail(item))
+          main, comment = pair
+          detail_lines << "Body:"
+          detail_lines.concat(Display.wrap(main["body"] || main["message"] || "(none)", detail_width))
+          detail_lines << "Latest comment:"
+          detail_lines.concat(Display.wrap(comment && (comment["body"] || comment["message"]) || "(none)", detail_width))
+        elsif @detail_error
+          detail_lines << "Body error: #{@detail_error.message}"
+        else
+          detail_lines << "Loading body…"
+        end
+      end
+      screen = []
+      if cols >= 100
+        visible.times do |i|
+          screen << item_row(items[i], first + i, left_width - 1, now) + "│" + Display.clip(detail_lines[i], cols - left_width)
+        end
+      else
+        list_rows = selected_item ? [visible / 2, 1].max : visible
+        list_rows.times { |i| screen << item_row(items[i], first + i, cols, now) }
+        (visible - list_rows).times { |i| screen << Display.clip(detail_lines[i], cols) }
+      end
+      updated = @inbox.last_checked_at ? "Updated #{@inbox.last_checked_at.strftime('%H:%M')}" : "Checking…"
+      remaining = [(@next_fetch - Process.clock_gettime(Process::CLOCK_MONOTONIC)).ceil, 0].max
+      footer = "#{updated} · next in #{remaining}s"
+      footer = "#{@message} | #{footer}" unless @message.empty?
+      frame = [Display.clip(title, cols), Display.clip(heading, cols), *screen, Display.clip(footer, cols)]
+      @output.write("\e[H\e[2J" + frame.first(rows).join("\r\n"))
+      @output.flush
+    end
+
+    def item_row(item, index, width, now)
+      return Display.clip(@inbox.items.empty? && index.zero? ? "No unread participating notifications" : "", width) unless item
+
+      prefix = if @marking_item && item["id"] == @marking_item["id"]
+                 "… "
+               elsif index == @selected
+                 "> "
+               else
+                 "  "
+               end
+      line = Display.clip(prefix + Display.item_line(item, now: now), width)
+      color = HUMAN_REASONS.include?(item["reason"]) ? "\e[1;33m" : "\e[2m"
+      color += "\e[7m" if index == @selected
+      "#{color}#{line}\e[0m"
+    end
+  end
+
+  def self.run(argv)
+    json = argv.delete("--json")
+    if argv.any? || !RUBY_VERSION.match?(/\A(?:[4-9]|3\.(?:[4-9]|[1-9]\d))\./)
+      warn "Usage: herdr-gh-inbox [--json] (Ruby 3.4+ required)"
+      return 2
+    end
+    tui = !json && $stdin.tty? && $stdout.tty?
+    inbox = Inbox.new(gh: Gh.new, osc: tui)
+    if tui
+      Tui.new(inbox).run
+    else
+      inbox.fetch
+      inbox.items.each { |item| puts JSON.generate(item) } if json
+      inbox.items.each { |item| puts Display.item_line(item) } unless json
+    end
+    0
+  rescue ApiError, JSON::ParserError => e
+    warn "herdr-gh-inbox: #{e.message}"
+    1
+  end
+end
+
+exit HerdrGhInbox.run(ARGV) if $PROGRAM_NAME == __FILE__

@@ -1,0 +1,52 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+
+args = ARGV.dup
+abort "expected api" unless args.shift == "api"
+args.delete("--include")
+method_index = args.index("--method")
+method = args[method_index + 1]
+args.slice!(method_index, 2)
+headers = []
+while (index = args.index("--header"))
+  headers << args[index + 1]
+  args.slice!(index, 2)
+end
+path = args.fetch(0)
+File.open(ENV.fetch("FAKE_GH_LOG"), "a") { |f| f.puts "#{method} #{path} #{headers.join('|')}" }
+if ENV["FAKE_GH_AUTH"] == "1"
+  puts "HTTP/2 401\r\n\r\n{}"
+  exit
+end
+if method == "GET" && path.start_with?("/notifications?")
+  if headers.any? { |header| header.start_with?("If-Modified-Since:") } && ENV["FAKE_GH_304"] == "1"
+    puts "HTTP/2 304\r\nX-Poll-Interval: 90\r\n\r\n"
+    exit
+  end
+  items = JSON.parse(File.read(File.join(__dir__, "notifications.json")))
+  items.reverse! if ENV["FAKE_GH_ORDER"] == "ambient_first"
+  if ENV["FAKE_GH_PAGES"] == "1"
+    if path.include?("page=2")
+      items = [items.last.merge("id" => "151")]
+    else
+      items = 50.times.map { |index| items.first.merge("id" => (100 + index).to_s) }
+    end
+  elsif path.include?("page=2")
+    items = []
+  end
+  body = JSON.generate(items)
+  print "HTTP/2 200\r\nLast-Modified: Sun, 15 Nov 2026 12:00:00 GMT\r\nX-Poll-Interval: 90\r\n\r\n#{body}"
+elsif method == "GET"
+  print "HTTP/2 200\r\n\r\n#{JSON.generate({"body" => "日本語の本文"})}"
+elsif %w[PATCH DELETE].include?(method)
+  sleep ENV["FAKE_GH_MARK_SLEEP"].to_f if ENV["FAKE_GH_MARK_SLEEP"]
+  if ENV["FAKE_GH_MARK_FAIL"] == "1"
+    print "HTTP/2 500\r\n\r\n{\"message\":\"failed\"}"
+  else
+    print "HTTP/2 #{method == 'PATCH' ? 205 : 204}\r\n\r\n"
+  end
+else
+  abort "unexpected request: #{method} #{path}"
+end
