@@ -430,15 +430,18 @@ module HerdrGhInbox
         begin
           redraw = true
           last_size = nil
+          last_remaining = nil
           loop do
             redraw = true if finish_mark
             redraw = true if finish_detail
-            break if @quit_after_mark && !@mark_thread
+            break if @quit_after_mark && @mark_thread.nil?
             @next_fetch = next_fetch
             size = @output.winsize
-            if redraw || size != last_size
+            remaining = (next_fetch - Process.clock_gettime(Process::CLOCK_MONOTONIC)).ceil
+            if redraw || size != last_size || remaining != last_remaining
               draw
               last_size = size
+              last_remaining = remaining
               redraw = false
             end
             now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -446,7 +449,7 @@ module HerdrGhInbox
             ready = IO.select([@input], nil, nil, [[next_fetch - now, 0].max, timeout].min)
             if ready
               key = @input.getc
-              break if key.nil? && !@mark_thread
+              break if key.nil? && @mark_thread.nil?
               if key == "q"
                 if @mark_thread
                   @quit_after_mark = true
@@ -458,7 +461,7 @@ module HerdrGhInbox
                 next_fetch = handle(key, next_fetch)
               end
               redraw = true
-            elsif !@mark_thread && Process.clock_gettime(Process::CLOCK_MONOTONIC) >= next_fetch
+            elsif @mark_thread.nil? && Process.clock_gettime(Process::CLOCK_MONOTONIC) >= next_fetch
               refresh
               next_fetch = Process.clock_gettime(Process::CLOCK_MONOTONIC) + @inbox.interval
               redraw = true
