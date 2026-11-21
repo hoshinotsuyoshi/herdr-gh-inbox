@@ -82,6 +82,8 @@ INBOX_BIN=./herdr-gh-inbox ruby -w test/inbox_test.rb
 
 Tests use an injected fake `gh` command (`HERDR_GH_INBOX_GH`) and never contact GitHub. CI tests Ruby 3.4 and 4.0 and a Spinel binary. Spinel is pinned in `.spinel-version`. A `v*` tag builds Linux x86_64 and arm64 and macOS arm64 binaries, then creates a release. GitHub Actions dependencies are recorded in `.github/workflows/actions.lock` (update with `gh actions-lock` after changing a `uses:` line).
 
+Write `@thread.nil?`, not `!@thread`, for an instance variable that holds a Thread or nil. Spinel compiles `!@thread` to a constant false, so the code works in Ruby and breaks in the binary. A test fails on any `!@ivar` in `bin/herdr-gh-inbox`.
+
 ## License
 
 MIT, see [LICENSE](LICENSE). Binary dependencies are listed in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).

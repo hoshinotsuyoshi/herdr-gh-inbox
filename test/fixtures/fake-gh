@@ -37,7 +37,8 @@ if method == "GET" && path.start_with?("/notifications?")
     items = []
   end
   body = JSON.generate(items)
-  print "HTTP/2 200\r\nLast-Modified: Sun, 15 Nov 2026 12:00:00 GMT\r\nX-Poll-Interval: 90\r\n\r\n#{body}"
+  poll = ENV.fetch("FAKE_GH_POLL_INTERVAL", "90")
+  print "HTTP/2 200\r\nLast-Modified: Sun, 15 Nov 2026 12:00:00 GMT\r\nX-Poll-Interval: #{poll}\r\n\r\n#{body}"
 elsif method == "GET"
   print "HTTP/2 200\r\n\r\n#{JSON.generate({"body" => "日本語の本文"})}"
 elsif %w[PATCH DELETE].include?(method)

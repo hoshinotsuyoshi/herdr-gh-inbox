@@ -219,7 +219,9 @@ module HerdrGhInbox
       @items = []
       @cache = {}
       @last_modified = nil
-      @interval = DEFAULT_INTERVAL
+      # Tests lower the floor to see a timed refresh without waiting a minute
+      @min_interval = ENV.fetch("HERDR_GH_INBOX_MIN_INTERVAL", DEFAULT_INTERVAL.to_s).to_i
+      @interval = @min_interval
       @state = nil
       @last_checked_at = nil
     end
@@ -229,7 +231,7 @@ module HerdrGhInbox
       headers << "If-Modified-Since: #{@last_modified}" if @last_modified && !force
       code, response_headers, body = @gh.request("/notifications?participating=true&per_page=50&page=1", headers: headers)
       poll = response_headers["x-poll-interval"].to_i
-      @interval = [DEFAULT_INTERVAL, poll].max
+      @interval = [@min_interval, poll].max
       @last_checked_at = Time.now
       return false if code == 304
 

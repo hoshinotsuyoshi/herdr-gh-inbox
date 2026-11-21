@@ -192,6 +192,23 @@ class InboxTest < Minitest::Test
     assert_includes output, "2 unread"
   end
 
+  # Runs the TUI with a 1 second poll interval and presses nothing: the list must be fetched again.
+  # Catches `!@mark_thread`, which Spinel compiles to a constant false, so the timed refresh never ran
+  def test_list_refreshes_after_the_poll_interval
+    env = {"HERDR_GH_INBOX_MIN_INTERVAL" => "1", "FAKE_GH_POLL_INTERVAL" => "1"}
+    fetches = -> { File.exist?(@log) ? File.readlines(@log).count { |line| line.start_with?("GET /notifications?") } : 0 }
+    run_tui_with_keys("", env, wait_until: -> { fetches.call >= 2 }, quit: false)
+    assert_operator fetches.call, :>=, 2
+  end
+
+  # Spinel compiles `!@ivar` to a constant false when the ivar holds a Thread or nil, so the
+  # binary silently skips the branch. Write `@ivar.nil?` instead
+  def test_no_negated_instance_variables
+    source = File.read(File.expand_path("../bin/herdr-gh-inbox", __dir__))
+    offenders = source.lines.each_with_index.select { |line, _| line.match?(/!@\w+(?![\w.(\[])/) }
+    assert_empty offenders.map { |line, index| "#{index + 1}: #{line.strip}" }
+  end
+
   private
 
   def fake_herdr_app
@@ -208,7 +225,7 @@ class InboxTest < Minitest::Test
     [HerdrGhInbox::HerdrApp.new(File.join(__dir__, "fixtures/fake-herdr-app")), log]
   end
 
-  def run_tui_with_keys(keys, extra_env, wait_for: nil, quit: true)
+  def run_tui_with_keys(keys, extra_env, wait_for: nil, wait_until: nil, quit: true)
     command = ENV["INBOX_BIN"] || RbConfig.ruby
     args = ENV["INBOX_BIN"] ? [] : [File.expand_path("../bin/herdr-gh-inbox", __dir__)]
     env = {"HERDR_GH_INBOX_GH" => File.join(__dir__, "fixtures/fake-gh"), "FAKE_GH_LOG" => @log}.merge(extra_env)
@@ -226,7 +243,7 @@ class InboxTest < Minitest::Test
         writer.write(keys)
         stage = "target"
         target = wait_for || (extra_env["FAKE_GH_MARK_FAIL"] == "1" ? "read failed" : "Marked read")
-        until output.include?(target.b)
+        until wait_until ? wait_until.call : output.include?(target.b)
           IO.select([reader], nil, nil, 0.1)
           chunk = reader.read_nonblock(8192, exception: false)
           output << chunk if chunk.is_a?(String)
